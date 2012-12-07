@@ -1,99 +1,388 @@
+//*****************************************************************************
+// This example code was modified to work on Eridani an LM3S3651 based board
+// The author imposes no change in the licence from TI below
+// The software remains AS IS with no Warranty
+//
+// usb_dev_mouse.c - Main routines for the enumeration example.
+//
+// Copyright (c) 2009-2010 Texas Instruments Incorporated.  All rights reserved.
+// Software License Agreement
+//
+// Texas Instruments (TI) is supplying this software for use solely and
+// exclusively on TI's microcontroller products. The software is owned by
+// TI and/or its suppliers, and is protected under applicable copyright
+// laws. You may not combine this software with "viral" open-source
+// software in order to form a larger program.
+//
+// THIS SOFTWARE IS PROVIDED "AS IS" AND WITH ALL FAULTS.
+// NO WARRANTIES, WHETHER EXPRESS, IMPLIED OR STATUTORY, INCLUDING, BUT
+// NOT LIMITED TO, IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE APPLY TO THIS SOFTWARE. TI SHALL NOT, UNDER ANY
+// CIRCUMSTANCES, BE LIABLE FOR SPECIAL, INCIDENTAL, OR CONSEQUENTIAL
+// DAMAGES, FOR ANY REASON WHATSOEVER.
+//
+// This is part of revision 6594 of the EK-LM3S9B92 Firmware Package.
+//
+//*****************************************************************************
+
 #include "inc/hw_memmap.h"
 #include "inc/hw_types.h"
+#include "inc/hw_gpio.h"
+#include "inc/hw_sysctl.h"
 #include "driverlib/debug.h"
+#include "driverlib/gpio.h"
+#include "driverlib/rom.h"
 #include "driverlib/sysctl.h"
-#include "grlib/grlib.h"
-#include "drivers/cfal96x64x16.h"
+#include "driverlib/systick.h"
+#include "usblib/usblib.h"
+#include "usblib/usbhid.h"
+#include "usblib/device/usbdevice.h"
+#include "usblib/device/usbdhid.h"
+#include "usblib/device/usbdhidmouse.h"
+#include "utils/uartstdio.h"
+#include "device_description.h"
 
-extern const unsigned char g_pucImage[];
-tContext sContext;
-tRectangle sRect;
-void ClrScreen();
+//*****************************************************************************
+//
+//! \addtogroup example_list
+//! <h1>USB HID Mouse Device (usb_dev_mouse)</h1>
+//!
+//! This example application turns the evaluation board into a USB mouse
+//! supporting the Human Interface Device class.  The mouse pointer will move
+//! in a square pattern for the duration of the time it is plugged in.
+//!
+//! UART0, connected to the FTDI virtual COM port and running at 115,200,
+//! 8-N-1, is used to display messages from this application.
+//
+//*****************************************************************************
 
+//*****************************************************************************
+//
+// The incremental update for the mouse.
+//
+//*****************************************************************************
+#define MOUSE_MOVE_INC          1
+#define MOUSE_MOVE_DEC          -1
+
+//*****************************************************************************
+//
+// The system tick timer rate.
+//
+//*****************************************************************************
+#define SYSTICKS_PER_SECOND     100
+#define MS_PER_SYSTICK          (1000 / SYSTICKS_PER_SECOND)
+
+//*****************************************************************************
+//
+// Holds command bits used to signal the main loop to perform various tasks.
+//
+//*****************************************************************************
+volatile unsigned long g_ulCommands;
+#define TICK_EVENT              0
+
+//*****************************************************************************
+//
+// A flag used to indicate whether or not we are currently connected to the USB
+// host.
+//
+//*****************************************************************************
+volatile tBoolean g_bConnected;
+volatile tBoolean g_bSuspended;
+
+//*****************************************************************************
+//
+// Global system tick counter holds elapsed time since the application started
+// expressed in 100ths of a second.
+//
+//*****************************************************************************
+volatile unsigned long g_ulSysTickCount;
+
+//*****************************************************************************
+//
+// The number of system ticks to wait for each USB packet to be sent before
+// we assume the host has disconnected.  The value 50 equates to half a second.
+//
+//*****************************************************************************
+#define MAX_SEND_DELAY          50
+
+//*****************************************************************************
+//
+// This enumeration holds the various states that the mouse can be in during
+// normal operation.
+//
+//*****************************************************************************
+volatile enum
+{
+    //
+    // Unconfigured.
+    //
+    MOUSE_STATE_UNCONFIGURED,
+
+    //
+    // No keys to send and not waiting on data.
+    //
+    MOUSE_STATE_IDLE,
+
+    //
+    // Waiting on data to be sent out.
+    //
+    MOUSE_STATE_SENDING
+}
+g_eMouseState = MOUSE_STATE_UNCONFIGURED;
+
+//*****************************************************************************
+//
+// The error routine that is called if the driver library encounters an error.
+//
+//*****************************************************************************
 #ifdef DEBUG
 void
-__error__(char* pcFilename, unsigned logn ulLine)
+__error__(char *pcFilename, unsigned long ulLine)
 {
-
 }
 #endif
 
-int main()
+//*****************************************************************************
+//
+// This function handles notification messages from the mouse device driver.
+//
+//*****************************************************************************
+unsigned long
+MouseHandler(void *pvCBData, unsigned long ulEvent,
+             unsigned long ulMsgData, void *pvMsgData)
 {
-	SysCtlClockSet(SYSCTL_SYSDIV_4|SYSCTL_USE_PLL|SYSCTL_OSC_MAIN|SYSCTL_XTAL_16MHZ);
+    switch(ulEvent)
+    {
+        //
+        // The USB host has connected to and configured the device.
+        //
+        case USB_EVENT_CONNECTED:
+        {
+            g_eMouseState = MOUSE_STATE_IDLE;
+            g_bConnected = true;
+            break;
+        }
 
-	CFAL96x64x16Init();
+        //
+        // The USB host has disconnected from the device.
+        //
+        case USB_EVENT_DISCONNECTED:
+        {
+            g_bConnected = false;
+            g_eMouseState = MOUSE_STATE_UNCONFIGURED;
+            break;
+        }
 
-	GrContextInit(&sContext, &g_sCFAL96x64x16);
+        //
+        // A report was sent to the host.  We are not free to send another.
+        //
+        case USB_EVENT_TX_COMPLETE:
+        {
+            g_eMouseState = MOUSE_STATE_IDLE;
+            break;
+        }
 
-	ClrScreen();
+        case USB_EVENT_SUSPEND:
+        {
+            g_bSuspended = true;
+            break;
+        }
 
-	GrImageDraw(&sContext, g_pucImage, 0, 0);
+    }
 
-	GrFlush(&sContext);
-
-	SysCtlDelay(SysCtlClockGet());
-
-	ClrScreen();
-
-	sRect.sXMin = 1;
-	sRect.sYMin = 1;
-	sRect.sXMax = 95;
-	sRect.sYMax = 63;
-	GrContextForegroundSet(&sContext, ClrBlue);
-	GrContextFontSet(&sContext, &g_sFontFixed6x8);
-	GrStringDraw(&sContext, "¤¤¤å", -1, 32, 10, 0);
-	GrStringDraw(&sContext, "Instruments", -1, 16, 20, 0);
-	GrStringDraw(&sContext, "Graphics", -1, 27, 40, 0);
-	GrStringDraw(&sContext, "Lab", -1, 40, 50, 0);
-	GrContextForegroundSet(&sContext, ClrWhite);
-	GrRectDraw(&sContext, &sRect);
-	GrFlush(&sContext);
-
-	SysCtlDelay(SysCtlClockGet());
-
-	ClrScreen();
-
-	GrContextForegroundSet(&sContext, ClrYellow);
-	GrCircleDraw(&sContext, 30, 30, 20);
-
-	sRect.sXMin = 55;
-	sRect.sYMin = 10;
-	sRect.sXMax = 90;
-	sRect.sYMax = 50;
-	GrContextForegroundSet(&sContext, ClrGreen);
-	GrRectDraw(&sContext, &sRect);
-
-	GrPixelDraw(&sContext, 30, 30);
-	GrLineDrawH(&sContext, 10, 90, 55);
-	GrLineDrawV(&sContext, 53, 10, 50);
-	GrFlush(&sContext);
-
-	SysCtlDelay(SysCtlClockGet());
-
-	GrContextForegroundSet(&sContext, ClrYellow);
-	GrCircleFill(&sContext, 30, 30, 20);
-	GrContextForegroundSet(&sContext, ClrGreen);
-	GrRectFill(&sContext, &sRect);
-	GrFlush(&sContext);
-
-	SysCtlDelay(SysCtlClockGet());
-
-
-	while(1)
-	{
-
-	}
+    return(0);
 }
 
-void ClrScreen()
+//***************************************************************************
+//
+// Wait for a period of time for the state to become idle.
+//
+// \param ulTimeoutTick is the number of system ticks to wait before
+// declaring a timeout and returning \b false.
+//
+// This function polls the current keyboard state for ulTimeoutTicks system
+// ticks waiting for it to become idle.  If the state becomes idle, the
+// function returns true.  If it ulTimeoutTicks occur prior to the state
+// becoming idle, false is returned to indicate a timeout.
+//
+// \return Returns \b true on success or \b false on timeout.
+//
+//***************************************************************************
+tBoolean
+WaitForSendIdle(unsigned long ulTimeoutTicks)
 {
-	sRect.sXMin = 0;
-	sRect.sYMin = 0;
-	sRect.sXMax = 95;
-	sRect.sYMax = 63;
-	GrContextForegroundSet(&sContext, ClrBlack);
-	GrRectFill(&sContext, &sRect);
-	GrFlush(&sContext);
+    unsigned long ulStart;
+    unsigned long ulNow;
+    unsigned long ulElapsed;
 
+    ulStart = g_ulSysTickCount;
+    ulElapsed = 0;
+
+    g_bConnected=false;
+    g_bSuspended=false;
+
+    while(ulElapsed < ulTimeoutTicks)
+    {
+        //
+        // Is the mouse is idle, return immediately.
+        //
+        if(g_eMouseState == MOUSE_STATE_IDLE)
+        {
+            return(true);
+        }
+
+        //
+        // Determine how much time has elapsed since we started waiting.  This
+        // should be safe across a wrap of g_ulSysTickCount.
+        //
+        ulNow = g_ulSysTickCount;
+        ulElapsed = ((ulStart < ulNow) ? (ulNow - ulStart) :
+                     (((unsigned long)0xFFFFFFFF - ulStart) + ulNow + 1));
+    }
+
+    //
+    // If we get here, we timed out so return a bad return code to let the
+    // caller know.
+    //
+    return(false);
+}
+
+//*****************************************************************************
+//
+// This function provides simulated movements of the mouse.
+//
+//*****************************************************************************
+void
+MoveHandler(void)
+{
+    unsigned long ulRetcode;
+    char cDeltaX, cDeltaY;
+
+    //
+    // Determine the direction to move the mouse.
+    //
+    ulRetcode = g_ulSysTickCount % (4 * SYSTICKS_PER_SECOND);
+    if(ulRetcode < SYSTICKS_PER_SECOND)
+    {
+        cDeltaX = MOUSE_MOVE_INC;
+        cDeltaY = 0;
+    }
+    else if(ulRetcode < (2 * SYSTICKS_PER_SECOND))
+    {
+        cDeltaX = 0;
+        cDeltaY = MOUSE_MOVE_INC;
+    }
+    else if(ulRetcode < (3 * SYSTICKS_PER_SECOND))
+    {
+        cDeltaX = (char)MOUSE_MOVE_DEC;
+        cDeltaY = 0;
+    }
+    else
+    {
+        cDeltaX = 0;
+        cDeltaY = (char)MOUSE_MOVE_DEC;
+    }
+
+    //
+    // Tell the HID driver to send this new report.
+    //
+    g_eMouseState = MOUSE_STATE_SENDING;
+    ulRetcode = USBDHIDMouseStateChange((void *)&g_sMouseDevice, cDeltaX,
+                                        cDeltaY, 0);
+
+    //
+    // Did we schedule the report for transmission?
+    //
+    if(ulRetcode == MOUSE_SUCCESS)
+    {
+        //
+        // Wait for the host to acknowledge the transmission if all went well.
+        //
+        if(!WaitForSendIdle(MAX_SEND_DELAY))
+        {
+            //
+            // The transmission failed, so assume the host disconnected and go
+            // back to waiting for a new connection.
+            //
+            g_bConnected = false;
+        }
+    }
+}
+
+//*****************************************************************************
+//
+// This is the interrupt handler for the SysTick interrupt.  It is called
+// periodically and updates a global tick counter then sets a flag to tell the
+// main loop to move the mouse.
+//
+//*****************************************************************************
+void
+SysTickIntHandler(void)
+{
+    g_ulSysTickCount++;
+    HWREGBITW(&g_ulCommands, TICK_EVENT) = 1;
+}
+
+//*****************************************************************************
+//
+// This is the main loop that runs the application.
+//
+//*****************************************************************************
+int
+main(void)
+{
+    //
+    // Set the clocking to run from the PLL at 50MHz.
+    //
+    SysCtlClockSet(SYSCTL_SYSDIV_4 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN |
+                       SYSCTL_XTAL_16MHZ);
+/*
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOG);
+    GPIOPinConfigure(GPIO_PG4_USB0EPEN);
+    GPIOPinTypeUSBDigital(GPIO_PORTG_BASE, GPIO_PIN_4);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOL);
+    GPIOPinTypeUSBAnalog(GPIO_PORTL_BASE, GPIO_PIN_6 | GPIO_PIN_7);
+    GPIOPinTypeUSBAnalog(GPIO_PORTB_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+*/
+    //
+    //
+    // Set the system tick to fire 100 times per second.
+    //
+    SysTickPeriodSet(SysCtlClockGet() / SYSTICKS_PER_SECOND);
+    SysTickIntEnable();
+    SysTickEnable();
+
+    //
+    // Pass the USB library our device information, initialize the USB
+    // controller and connect the device to the bus.
+    //
+    USBDHIDMouseInit(0, (tUSBDHIDMouseDevice *)&g_sMouseDevice);
+    USBDHIDMouseRemoteWakeupRequest((void *)&g_sMouseDevice);
+    //
+    // Drop into the main loop.
+    //
+    while(1)
+    {
+        //
+        // Wait for USB configuration to complete.
+        //
+        while(!g_bConnected)
+        {
+        }
+        //
+        // Now keep processing the mouse as long as the host is connected.
+        //
+        while(g_bConnected)
+        {
+            //
+            // If it is time to move the mouse then do so.
+            //
+            if(HWREGBITW(&g_ulCommands, TICK_EVENT) == 1)
+            {
+                HWREGBITW(&g_ulCommands, TICK_EVENT) = 0;
+                MoveHandler();
+            }
+        }
+    }
 }
